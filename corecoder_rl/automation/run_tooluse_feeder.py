@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import time
 import uuid
@@ -23,23 +24,30 @@ DEFAULT_URL = "http://127.0.0.1:30000/v1/chat/completions"
 DEFAULT_MODEL = "qwen3-4b"
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
-TOOLUSE_SYSTEM_PROMPT = """You are a careful math agent.
-You have exactly one tool named python. For arithmetic in word problems, call python first.
-After observing the tool result, give a short final answer.
+TOOLUSE_SYSTEM_PROMPT = """You are a math agent. You may use the available tools when they are helpful.
+Available tool:
+- python: useful for arithmetic, algebra, checking numeric calculations, and small data calculations.
+
+Use a tool only when it helps. If the problem is simple enough, answer directly.
+When you use a tool, wait for the tool result before giving the final answer.
 Do not invent tool results. Do not call any tool except python.
 """
 
 
-def load_scenarios(path: Path, limit: int) -> list[dict[str, Any]]:
+def load_scenarios(path: Path, limit: int, seed: int | None = None) -> list[dict[str, Any]]:
     rows = []
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
-            if not line.strip():
-                continue
-            rows.append(json.loads(line))
-            if limit and len(rows) >= limit:
-                break
-    return rows
+            if line.strip():
+                rows.append(json.loads(line))
+    rng = random.Random(seed) if seed is not None else random.SystemRandom()
+    rng.shuffle(rows)
+    return rows[:limit] if limit else rows
+
+
+def build_user_message(scenario: dict[str, Any]) -> str:
+    question = scenario.get("question") or scenario.get("opening_user_message", "")
+    return f"Solve this math word problem. You may use the python tool if it helps. Give a concise final answer.\n\n{question}"
 
 
 def post_turn(client: httpx.Client, args: argparse.Namespace, session_id: str, messages: list[dict[str, Any]], done: bool, metadata: dict[str, Any], max_tokens: int) -> dict[str, Any]:
@@ -121,17 +129,17 @@ def run_session(client: httpx.Client, args: argparse.Namespace, scenario: dict[s
     session_id = f"corecoder-tooluse-{scenario.get('scenario_id', 'scenario')}-{uuid.uuid4().hex[:8]}"
     messages = [
         {"role": "system", "content": TOOLUSE_SYSTEM_PROMPT},
-        {"role": "user", "content": scenario["opening_user_message"]},
+        {"role": "user", "content": build_user_message(scenario)},
     ]
     metadata = {
         "scenario_id": scenario.get("scenario_id"),
         "student_mode": "tool_env",
-        "student_model": "python",
+        "student_model": "corecoder_policy",
         "feeder_id": args.feeder_id,
         "rl_method": args.rl_method,
         "prompt_source": "tooluse",
         "extra_prompt_model": "none",
-        "requires_tool": True,
+        "requires_tool": "optional",
         "allowed_tools": "python",
         "question": scenario.get("question"),
         "reference_answer": scenario.get("reference_answer"),
@@ -161,7 +169,7 @@ def run_session(client: httpx.Client, args: argparse.Namespace, scenario: dict[s
     final_msg = assistant_message(final)
     messages.append(final_msg)
     is_correct = final_correct(final_msg.get("content", ""), scenario.get("reference_answer", ""))
-    reward = 1.0 if is_correct and tool_success else 0.0
+    reward = 1.0 if is_correct else 0.0
 
     return {
         "session_id": session_id,
@@ -186,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--api-key", default=os.getenv("CORECODER_RL_API_KEY", os.getenv("SGLANG_API_KEY", "change-me")))
     parser.add_argument("--model", default=os.getenv("CORECODER_RL_MODEL", DEFAULT_MODEL))
     parser.add_argument("--limit", type=int, default=int(os.getenv("CORECODER_TOOLUSE_LIMIT", "4")))
+    seed_env = os.getenv("CORECODER_TOOLUSE_SEED", "")
+    parser.add_argument("--seed", type=int, default=int(seed_env) if seed_env else None)
     parser.add_argument("--output", type=Path, default=Path(os.getenv("CORECODER_TOOLUSE_OUTPUT", "/root/autodl-tmp/corecoder_rl/logs/corecoder_tooluse_trajectories.jsonl")))
     parser.add_argument("--temperature", type=float, default=float(os.getenv("CORECODER_TOOLUSE_TEMPERATURE", "0.2")))
     parser.add_argument("--tool-timeout", type=float, default=float(os.getenv("CORECODER_TOOL_TIMEOUT", "3")))
@@ -199,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
-    scenarios = load_scenarios(args.scenario_bank, args.limit)
+    scenarios = load_scenarios(args.scenario_bank, args.limit, args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.dry_run:
         print(json.dumps({"scenarios": [s.get("scenario_id") for s in scenarios], "tools": [PYTHON_TOOL_SCHEMA]}, ensure_ascii=False))

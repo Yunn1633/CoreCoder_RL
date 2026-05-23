@@ -231,13 +231,24 @@ class CoreCoderAPIServer:
         self._teacher_logprob_enabled = os.getenv("CORECODER_TEACHER_LOGPROB_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
         self._teacher_logprob_prompt = os.getenv(
             "CORECODER_TEACHER_LOGPROB_PROMPT",
-            "You are an expert teacher model. Observe the same student-generated trajectory "
-            "and assign next-token probabilities to the exact assistant trajectory under the best "
-            "available task context. Do not generate a new response here."
+            "You are an expert teacher model. Use the teacher extra instruction and task context "
+            "to evaluate the same student-generated trajectory. Do not generate a new response here."
         )
         self._teacher_use_reference_answer = os.getenv(
             "CORECODER_TEACHER_USE_REFERENCE_ANSWER", "1"
         ).lower() not in {"0", "false", "no", "off"}
+        self._teacher_extra_prompt_enabled = os.getenv(
+            "CORECODER_TEACHER_EXTRA_PROMPT_ENABLED", "1"
+        ).lower() not in {"0", "false", "no", "off"}
+        self._teacher_extra_prompt_model = os.getenv("CORECODER_TEACHER_EXTRA_PROMPT_MODEL", "deepseek-v4-flash")
+        self._teacher_extra_prompt_base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+        self._teacher_extra_prompt_api_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if not self._teacher_extra_prompt_api_key:
+            try:
+                self._teacher_extra_prompt_api_key = open("/root/.corecoder_deepseek_api_key", encoding="utf-8").read().strip()
+            except OSError:
+                self._teacher_extra_prompt_api_key = ""
+        self._teacher_extra_prompt_cache: dict[str, str] = {}
 
         self._prm_enabled = getattr(args, "prm_enable", False)
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
@@ -515,8 +526,90 @@ class CoreCoderAPIServer:
             td["has_next_state"] = True
 
     # ---------------------------------------------------- teacher trajectory scoring
-    def _build_teacher_context(self, metadata: dict[str, Any]) -> str:
+    def _render_messages_for_teacher(self, messages: list, response_msg: dict | None = None) -> str:
+        rows = []
+        for msg in list(messages) + ([response_msg] if response_msg else []):
+            if not msg:
+                continue
+            role = msg.get("role", "?")
+            content = _flatten_message_content(msg.get("content"))
+            reasoning = msg.get("reasoning_content")
+            if reasoning:
+                content = f"[reasoning] {reasoning}\n[content] {content}"
+            calls = msg.get("tool_calls")
+            if calls:
+                content += "\n[tool_calls] " + json.dumps(calls, ensure_ascii=False)
+            rows.append(f"{role}: {content}")
+        return "\n\n".join(rows)
+
+    def _build_teacher_extra_prompt_messages(self, messages: list, response_msg: dict, metadata: dict[str, Any]) -> list[dict]:
+        question = metadata.get("question", "")
+        reference = metadata.get("reference_answer", "") if self._teacher_use_reference_answer else ""
+        allowed_tools = metadata.get("allowed_tools", "python")
+        trajectory = self._render_messages_for_teacher(messages, response_msg)
+        system = (
+            "You are a teacher model helping improve a math tool-use agent. "
+            "Given the task, available tools, optional reference answer, and the student's trajectory so far, "
+            "write one short extra instruction that would help the student produce a better answer. "
+            "Focus on whether a tool is useful, what to compute/check, and how to avoid mistakes. "
+            "Do not solve the whole problem. Do not include analysis or hidden reasoning. "
+            "Do not replace the student's response. Output only the extra instruction."
+        )
+        user = (
+            f"Task question:\n{question}\n\n"
+            f"Reference answer, visible only to you:\n{reference}\n\n"
+            f"Available tools:\n{allowed_tools}\n\n"
+            f"Student trajectory so far:\n{trajectory}\n\n"
+            "Extra instruction:"
+        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    async def _generate_teacher_extra_prompt(self, messages: list, response_msg: dict, metadata: dict[str, Any]) -> str:
+        if not self._teacher_extra_prompt_enabled:
+            return ""
+        cache_key = json.dumps({
+            "messages": messages,
+            "response": response_msg,
+            "question": metadata.get("question"),
+            "reference_answer": metadata.get("reference_answer") if self._teacher_use_reference_answer else None,
+            "allowed_tools": metadata.get("allowed_tools"),
+        }, ensure_ascii=False, sort_keys=True, default=str)
+        if cache_key in self._teacher_extra_prompt_cache:
+            return self._teacher_extra_prompt_cache[cache_key]
+        if not self._teacher_extra_prompt_api_key:
+            logger.warning("[CoreCoder] teacher extra prompt disabled: missing DEEPSEEK_API_KEY")
+            return ""
+        payload = {
+            "model": self._teacher_extra_prompt_model,
+            "messages": self._build_teacher_extra_prompt_messages(messages, response_msg, metadata),
+            "temperature": 0.2,
+            "max_tokens": 512,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    f"{self._teacher_extra_prompt_base_url}/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {self._teacher_extra_prompt_api_key}"},
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+            msg = ((data.get("choices") or [{}])[0].get("message") or {})
+            text = (msg.get("content") or "").strip()
+            if not text:
+                text = (msg.get("reasoning_content") or "").strip()
+            text = " ".join(text.split())[:1000]
+            self._teacher_extra_prompt_cache[cache_key] = text
+            logger.info("[CoreCoder] teacher extra prompt (%s): %s", self._teacher_extra_prompt_model, text[:300])
+            return text
+        except Exception as e:
+            logger.warning("[CoreCoder] teacher extra prompt generation failed: %s", e)
+            return ""
+
+    def _build_teacher_context(self, metadata: dict[str, Any], extra_prompt: str = "") -> str:
         parts = [self._teacher_logprob_prompt]
+        if extra_prompt:
+            parts.append(f"Teacher extra instruction:\n{extra_prompt}")
         question = metadata.get("question")
         if question:
             parts.append(f"Task question:\n{question}")
@@ -529,8 +622,8 @@ class CoreCoderAPIServer:
             parts.append(f"Rubric/checker: {rubric}")
         return "\n\n".join(str(p) for p in parts if p is not None)
 
-    def _build_teacher_scoring_ids(self, messages: list, response_msg: dict, tools, metadata: dict[str, Any]) -> tuple[list[int], list[int]]:
-        system_msg = {"role": "system", "content": self._build_teacher_context(metadata)}
+    def _build_teacher_scoring_ids(self, messages: list, response_msg: dict, tools, metadata: dict[str, Any], extra_prompt: str = "") -> tuple[list[int], list[int]]:
+        system_msg = {"role": "system", "content": self._build_teacher_context(metadata, extra_prompt)}
         norm_msgs = _normalize_messages_for_template([system_msg] + messages)
         norm_resp = _normalize_messages_for_template([response_msg])[0]
         full_norm = norm_msgs + [norm_resp]
@@ -548,7 +641,12 @@ class CoreCoderAPIServer:
         if not self._teacher_logprob_enabled or response_len <= 0:
             return []
         try:
-            prompt_ids, full_ids = self._build_teacher_scoring_ids(messages, response_msg, tools, metadata or {})
+            metadata = metadata or {}
+            extra_prompt = await self._generate_teacher_extra_prompt(messages, response_msg, metadata)
+            if extra_prompt:
+                metadata["teacher_extra_prompt"] = extra_prompt
+                metadata["teacher_extra_prompt_model"] = self._teacher_extra_prompt_model
+            prompt_ids, full_ids = self._build_teacher_scoring_ids(messages, response_msg, tools, metadata, extra_prompt)
             if len(full_ids) <= len(prompt_ids):
                 return []
             payload = {
@@ -799,6 +897,8 @@ class CoreCoderAPIServer:
             "reference_answer_present": bool(metadata.get("reference_answer")),
             "question_present": bool(metadata.get("question")),
             "checker": metadata.get("checker"),
+            "teacher_extra_prompt_present": bool(metadata.get("teacher_extra_prompt")),
+            "teacher_extra_prompt_model": metadata.get("teacher_extra_prompt_model"),
         }
         try:
             with open(self._metrics_file, "a", encoding="utf-8") as f:
