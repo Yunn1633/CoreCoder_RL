@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _BOXED_RE = re.compile(r"\\boxed\{([-+]?\d)\}")
 
-_NON_STANDARD_BODY_KEYS = {"session_id", "session_done", "turn_type", "scenario_id", "student_mode", "student_model", "feeder_id", "rl_method", "prompt_source", "extra_prompt_model"}
+_NON_STANDARD_BODY_KEYS = {"session_id", "session_done", "turn_type", "scenario_id", "student_mode", "student_model", "feeder_id", "rl_method", "prompt_source", "extra_prompt_model", "requires_tool", "allowed_tools", "tool_call_count", "tool_success", "tool_name", "final_correct", "reference_answer", "question", "checker"}
 
 
 def _flatten_message_content(content):
@@ -231,10 +231,13 @@ class CoreCoderAPIServer:
         self._teacher_logprob_enabled = os.getenv("CORECODER_TEACHER_LOGPROB_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
         self._teacher_logprob_prompt = os.getenv(
             "CORECODER_TEACHER_LOGPROB_PROMPT",
-            "You are an expert teacher model with access to the correct answer or rubric. "
-            "Observe the same student-generated trajectory and assign next-token probabilities to the teacher response that would stay on the correct path. "
-            "Use any extra prompt in the dialogue as guidance, but do not generate a new response here."
+            "You are an expert teacher model. Observe the same student-generated trajectory "
+            "and assign next-token probabilities to the exact assistant trajectory under the best "
+            "available task context. Do not generate a new response here."
         )
+        self._teacher_use_reference_answer = os.getenv(
+            "CORECODER_TEACHER_USE_REFERENCE_ANSWER", "1"
+        ).lower() not in {"0", "false", "no", "off"}
 
         self._prm_enabled = getattr(args, "prm_enable", False)
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
@@ -343,7 +346,8 @@ class CoreCoderAPIServer:
                 f"next_state role={ns_role} len={len(ns_content)}: "
                 f"{ns_content[:200]}{_RESET}"
             )
-            self._fire_prm_scoring(session_id, rec["turn"], rec["response_text"], next_state)
+            if not self._score_tool_next_state(session_id, rec["turn"], next_state):
+                self._fire_prm_scoring(session_id, rec["turn"], rec["response_text"], next_state)
         if self._record_file:
             try:
                 with open(self._record_file, "a", encoding="utf-8") as f:
@@ -471,6 +475,31 @@ class CoreCoderAPIServer:
         self._append_prm_record(session_id, turn_num, final, votes_display, representative)
         return {"score": final, "votes": votes_display, "representative_eval": representative}
 
+    def _score_tool_next_state(self, session_id: str, turn_num: int, next_state) -> bool:
+        """Apply deterministic process reward for tool observations.
+
+        A non-error tool result is exactly the environmental confirmation we need
+        for tool-call training, so this path bypasses PRM and submits the
+        assistant tool_call tokens directly into OPSD.
+        """
+        if not next_state or next_state.get("role") != "tool":
+            return False
+        td = self._pending_turn_data.get(session_id, {}).get(turn_num)
+        if td is None:
+            return True
+        content = _flatten_message_content(next_state.get("content"))
+        ok = False
+        try:
+            parsed = json.loads(content)
+            ok = bool(parsed.get("ok")) and not parsed.get("error")
+        except Exception:
+            ok = "error" not in content.lower() and bool(content.strip())
+        td["has_next_state"] = True
+        td["deterministic_score"] = 1.0 if ok else -1.0
+        logger.info("[CoreCoder] tool next_state session=%s turn=%d deterministic_score=%.1f", session_id, turn_num, td["deterministic_score"])
+        self._maybe_submit_ready_samples(session_id, force_no_prm=True)
+        return True
+
     def _fire_prm_scoring(self, session_id: str, turn_num: int,
                           response_text: str, next_state):
         if not self._prm_enabled or not next_state:
@@ -486,8 +515,22 @@ class CoreCoderAPIServer:
             td["has_next_state"] = True
 
     # ---------------------------------------------------- teacher trajectory scoring
-    def _build_teacher_scoring_ids(self, messages: list, response_msg: dict, tools) -> tuple[list[int], list[int]]:
-        system_msg = {"role": "system", "content": self._teacher_logprob_prompt}
+    def _build_teacher_context(self, metadata: dict[str, Any]) -> str:
+        parts = [self._teacher_logprob_prompt]
+        question = metadata.get("question")
+        if question:
+            parts.append(f"Task question:\n{question}")
+        if self._teacher_use_reference_answer and metadata.get("reference_answer"):
+            parts.append(f"Reference answer, visible only to the teacher:\n{metadata['reference_answer']}")
+        if metadata.get("allowed_tools"):
+            parts.append(f"Allowed tools: {metadata['allowed_tools']}")
+        rubric = metadata.get("checker") or metadata.get("rubric")
+        if rubric:
+            parts.append(f"Rubric/checker: {rubric}")
+        return "\n\n".join(str(p) for p in parts if p is not None)
+
+    def _build_teacher_scoring_ids(self, messages: list, response_msg: dict, tools, metadata: dict[str, Any]) -> tuple[list[int], list[int]]:
+        system_msg = {"role": "system", "content": self._build_teacher_context(metadata)}
         norm_msgs = _normalize_messages_for_template([system_msg] + messages)
         norm_resp = _normalize_messages_for_template([response_msg])[0]
         full_norm = norm_msgs + [norm_resp]
@@ -501,11 +544,11 @@ class CoreCoderAPIServer:
         full_ids = self.tokenizer(full_text, add_special_tokens=False)["input_ids"]
         return prompt_ids, full_ids
 
-    async def _score_teacher_log_probs(self, messages: list, response_msg: dict, tools, response_len: int) -> list[float]:
+    async def _score_teacher_log_probs(self, messages: list, response_msg: dict, tools, response_len: int, metadata: dict[str, Any] | None = None) -> list[float]:
         if not self._teacher_logprob_enabled or response_len <= 0:
             return []
         try:
-            prompt_ids, full_ids = self._build_teacher_scoring_ids(messages, response_msg, tools)
+            prompt_ids, full_ids = self._build_teacher_scoring_ids(messages, response_msg, tools, metadata or {})
             if len(full_ids) <= len(prompt_ids):
                 return []
             payload = {
@@ -557,6 +600,15 @@ class CoreCoderAPIServer:
             "rl_method": body.get("rl_method"),
             "prompt_source": body.get("prompt_source"),
             "extra_prompt_model": body.get("extra_prompt_model"),
+            "requires_tool": body.get("requires_tool"),
+            "allowed_tools": body.get("allowed_tools"),
+            "tool_call_count": body.get("tool_call_count"),
+            "tool_success": body.get("tool_success"),
+            "tool_name": body.get("tool_name"),
+            "final_correct": body.get("final_correct"),
+            "reference_answer": body.get("reference_answer"),
+            "question": body.get("question"),
+            "checker": body.get("checker"),
         }
         request_metadata = {k: v for k, v in request_metadata.items() if v not in (None, "")}
         if request_metadata:
@@ -642,7 +694,8 @@ class CoreCoderAPIServer:
             self._turn_counts[session_id] = self._turn_counts.get(session_id, 0) + 1
             turn_num = self._turn_counts[session_id]
 
-            teacher_logprobs = await self._score_teacher_log_probs(messages, response_msg, tools, len(response_ids))
+            metadata = dict(self._session_metadata.get(session_id, {}))
+            teacher_logprobs = await self._score_teacher_log_probs(messages, response_msg, tools, len(response_ids), metadata)
             if len(teacher_logprobs) != len(response_ids):
                 teacher_logprobs = response_logprobs[:]
                 logger.warning("[CoreCoder] falling back to rollout logprobs as teacher targets for session=%s turn=%d", session_id, turn_num)
@@ -655,7 +708,7 @@ class CoreCoderAPIServer:
                 "teacher_logprobs": teacher_logprobs,
                 "prompt_text": prompt_text,
                 "response_text": response_text,
-                "metadata": dict(self._session_metadata.get(session_id, {})),
+                "metadata": metadata,
             }
 
             logger.info(
@@ -737,6 +790,15 @@ class CoreCoderAPIServer:
             "teacher_logprob_mean": (sum(turn_data.get("teacher_logprobs", []) or [0.0]) / max(1, len(turn_data.get("teacher_logprobs", [])))),
             "prm_votes": (prm_result or {}).get("votes"),
             "prm_representative_eval": bool((prm_result or {}).get("representative_eval")),
+            "requires_tool": metadata.get("requires_tool"),
+            "allowed_tools": metadata.get("allowed_tools"),
+            "tool_call_count": metadata.get("tool_call_count"),
+            "tool_success": metadata.get("tool_success"),
+            "tool_name": metadata.get("tool_name"),
+            "final_correct": metadata.get("final_correct"),
+            "reference_answer_present": bool(metadata.get("reference_answer")),
+            "question_present": bool(metadata.get("question")),
+            "checker": metadata.get("checker"),
         }
         try:
             with open(self._metrics_file, "a", encoding="utf-8") as f:
@@ -752,6 +814,8 @@ class CoreCoderAPIServer:
         has_next_state = turn_data.get("has_next_state", False)
         if prm_result:
             score = prm_result["score"]
+        elif "deterministic_score" in turn_data:
+            score = float(turn_data["deterministic_score"])
         else:
             score = 0.0
 

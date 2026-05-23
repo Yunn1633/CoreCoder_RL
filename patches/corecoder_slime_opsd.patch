@@ -98,12 +98,24 @@ index 3c5c271..c9cbd45 100644
 +                log_probs = log_probs[:n]
 +
 +            logprob_diff = log_probs - teacher_log_probs
-+            distill_token_loss = logprob_diff.pow(2)
-+            distill_abs_diff = logprob_diff.abs()
++            distill_token_mse = logprob_diff.pow(2)
++            distill_abs_diff_tokens = logprob_diff.abs()
++
++            # Sampled forward-KL estimate: E_student[(p_teacher / p_student) * (log p_teacher - log p_student)].
++            # The importance ratio is detached and clipped per token for stability.
++            clip = float(os.getenv("CORECODER_OPSD_TOKEN_LOGRATIO_CLIP", "5.0"))
++            log_ratio = (teacher_log_probs.detach() - log_probs.detach()).clamp(min=-clip, max=clip)
++            importance = log_ratio.exp()
++            forward_kl_token_estimate = importance * (teacher_log_probs.detach() - log_probs.detach())
++            distill_token_loss = -importance * log_probs
 +            loss = sum_of_sample_mean(distill_token_loss, response_lengths, loss_masks)
++
 +            teacher_logprob_mean = sum_of_sample_mean(teacher_log_probs, response_lengths, loss_masks).detach()
 +            student_logprob_mean = sum_of_sample_mean(log_probs, response_lengths, loss_masks).detach()
-+            distill_abs_diff = sum_of_sample_mean(distill_abs_diff, response_lengths, loss_masks).detach()
++            distill_abs_diff = sum_of_sample_mean(distill_abs_diff_tokens, response_lengths, loss_masks).detach()
++            distill_mse = sum_of_sample_mean(distill_token_mse, response_lengths, loss_masks).detach()
++            importance_mean = sum_of_sample_mean(importance, response_lengths, loss_masks).detach()
++            forward_kl_estimate = sum_of_sample_mean(forward_kl_token_estimate, response_lengths, loss_masks).detach()
 +
 +            entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
 +            entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
@@ -112,8 +124,10 @@ index 3c5c271..c9cbd45 100644
 +            reported = {
 +                "loss": loss.detach(),
 +                "opd_loss": loss.detach(),
-+                "opd_logprob_mse": sum_of_sample_mean(distill_token_loss, response_lengths, loss_masks).detach(),
++                "opsd_forward_kl": forward_kl_estimate,
++                "opd_logprob_mse": distill_mse,
 +                "opd_logprob_abs_diff": distill_abs_diff,
++                "opsd_importance_mean": importance_mean,
 +                "student_log_probs": student_logprob_mean,
 +                "teacher_log_probs": teacher_logprob_mean,
 +                "entropy_loss": entropy_loss.detach(),
