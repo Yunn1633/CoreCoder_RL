@@ -26,4 +26,4 @@ The CoreCoder_RL glue code in this repository is released under the MIT License.
 
 ## Acknowledgements
 
-This project is built upon the excellent work of [CoreCoder](https://github.com/he-yufeng/CoreCoder) and [slime](https://github.com/THUDM/slime). We thank the authors of these projects.
+This project is built upon the excellent work of [CoreCoder](https://github.com/he-yufeng/CoreCoder), [OpenClaw-RL](https://github.com/Gen-Verse/OpenClaw-RL), and [slime](https://github.com/THUDM/slime). We thank the authors of these projects.

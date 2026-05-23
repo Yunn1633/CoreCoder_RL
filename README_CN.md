@@ -26,4 +26,4 @@ CoreCoder_RL 是一个轻量级研究项目，基于 [slime](https://github.com/
 
 ## 致谢
 
-本项目基于以下精彩的项目构建：[CoreCoder](https://github.com/he-yufeng/CoreCoder)、[slime](https://github.com/THUDM/slime)，对这些项目的作者表示感谢。
+本项目基于以下精彩的项目构建：[CoreCoder](https://github.com/he-yufeng/CoreCoder)、[OpenClaw-RL](https://github.com/Gen-Verse/OpenClaw-RL)、[slime](https://github.com/THUDM/slime)，对这些项目的作者表示感谢。
