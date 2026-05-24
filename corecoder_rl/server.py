@@ -331,6 +331,13 @@ class CoreCoderAPIServer:
                 return StreamingResponse(owner._stream_response(result), media_type="text/event-stream")
             return JSONResponse(content=result["response"])
 
+        @app.post("/corecoder/session_done")
+        async def corecoder_session_done(request: Request, authorization: str | None = Header(default=None)):
+            owner: CoreCoderAPIServer = request.app.state.owner
+            await owner._check_auth(authorization)
+            body = await request.json()
+            return JSONResponse(content=owner._finalize_agent_session(body))
+
         return app
 
     async def _check_auth(self, authorization: str | None):
@@ -341,6 +348,49 @@ class CoreCoderAPIServer:
         token = authorization.split(" ", 1)[1].strip()
         if token != self.expected_api_key:
             raise HTTPException(status_code=401, detail="invalid api key")
+
+    def _metadata_from_body(self, body: dict[str, Any]) -> dict[str, Any]:
+        request_metadata = {
+            "scenario_id": body.get("scenario_id"),
+            "student_mode": body.get("student_mode"),
+            "student_model": body.get("student_model"),
+            "feeder_id": body.get("feeder_id"),
+            "rl_method": body.get("rl_method"),
+            "prompt_source": body.get("prompt_source"),
+            "extra_prompt_model": body.get("extra_prompt_model"),
+            "requires_tool": body.get("requires_tool"),
+            "allowed_tools": body.get("allowed_tools"),
+            "tool_call_count": body.get("tool_call_count"),
+            "tool_success": body.get("tool_success"),
+            "tool_name": body.get("tool_name"),
+            "final_correct": body.get("final_correct"),
+            "reference_answer": body.get("reference_answer"),
+            "question": body.get("question"),
+            "checker": body.get("checker"),
+        }
+        return {k: v for k, v in request_metadata.items() if v not in (None, "")}
+
+    def _finalize_agent_session(self, body: dict[str, Any]) -> dict[str, Any]:
+        session_id = body.get("session_id") or "unknown"
+        metadata = self._metadata_from_body(body)
+        if metadata:
+            self._session_metadata.setdefault(session_id, {}).update(metadata)
+        try:
+            score = float(body.get("reward"))
+        except (TypeError, ValueError):
+            score = 1.0 if bool(body.get("final_correct")) else 0.0
+        pending = self._pending_turn_data.get(session_id, {})
+        if pending:
+            turn_num = max(pending)
+            pending[turn_num]["deterministic_score"] = score
+            pending[turn_num]["has_next_state"] = True
+            pending[turn_num].setdefault("metadata", {}).update(metadata)
+        self._flush_pending_record(session_id, None)
+        self._maybe_submit_ready_samples(session_id, force_no_prm=True)
+        eff = self._session_effective.pop(session_id, 0)
+        self._turn_counts.pop(session_id, None)
+        logger.info("[CoreCoder] session=%s finalized by CoreCoder Agent (score=%.1f effective_samples=%d)", session_id, score, eff)
+        return {"ok": True, "session_id": session_id, "score": score, "effective_samples": eff}
 
     # ---------------------------------------------------- record file
     def _flush_pending_record(self, session_id: str, next_state):
@@ -690,25 +740,7 @@ class CoreCoderAPIServer:
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list")
 
-        request_metadata = {
-            "scenario_id": body.get("scenario_id"),
-            "student_mode": body.get("student_mode"),
-            "student_model": body.get("student_model"),
-            "feeder_id": body.get("feeder_id"),
-            "rl_method": body.get("rl_method"),
-            "prompt_source": body.get("prompt_source"),
-            "extra_prompt_model": body.get("extra_prompt_model"),
-            "requires_tool": body.get("requires_tool"),
-            "allowed_tools": body.get("allowed_tools"),
-            "tool_call_count": body.get("tool_call_count"),
-            "tool_success": body.get("tool_success"),
-            "tool_name": body.get("tool_name"),
-            "final_correct": body.get("final_correct"),
-            "reference_answer": body.get("reference_answer"),
-            "question": body.get("question"),
-            "checker": body.get("checker"),
-        }
-        request_metadata = {k: v for k, v in request_metadata.items() if v not in (None, "")}
+        request_metadata = self._metadata_from_body(body)
         if request_metadata:
             self._session_metadata.setdefault(session_id, {}).update(request_metadata)
 

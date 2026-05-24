@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Feed Python-tool GSM8K-style agent trajectories into the CoreCoder RL proxy."""
+"""Feed GSM8K Python-tool trajectories through the real CoreCoder Agent loop."""
 
 from __future__ import annotations
 
@@ -15,7 +15,10 @@ from typing import Any
 
 import httpx
 
-from corecoder_rl.tool_env import PYTHON_TOOL_SCHEMA, execute_python_tool
+from corecoder import Agent
+from corecoder.llm import LLMResponse, ToolCall
+from corecoder.tools.base import Tool
+from corecoder_rl.tool_env import execute_python_tool
 from corecoder_rl.tool_env.python_tool import parse_python_tool_arguments
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -24,14 +27,118 @@ DEFAULT_URL = "http://127.0.0.1:30000/v1/chat/completions"
 DEFAULT_MODEL = "qwen3-4b"
 _NUM_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
-TOOLUSE_SYSTEM_PROMPT = """You are a math agent. You may use the available tools when they are helpful.
-Available tool:
-- python: useful for arithmetic, algebra, checking numeric calculations, and small data calculations.
-
+MATH_AGENT_TASK_PREFIX = """You are solving a math word problem as CoreCoder.
+You may use the python tool when it is helpful for arithmetic, algebra, numeric checks, or small calculations.
 Use a tool only when it helps. If the problem is simple enough, answer directly.
 When you use a tool, wait for the tool result before giving the final answer.
-Do not invent tool results. Do not call any tool except python.
+Give a concise final answer.
+
+Problem:
 """
+
+
+class PythonMathTool(Tool):
+    name = "python"
+    description = "Run a small, safe Python snippet for arithmetic, algebra, numeric checks, or small data calculations."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute. The last expression is returned when possible.",
+            }
+        },
+        "required": ["code"],
+    }
+
+    def __init__(self, timeout: float = 3.0):
+        self.timeout = timeout
+
+    def execute(self, code: str = "") -> str:
+        return execute_python_tool(code, timeout=self.timeout).to_message_content()
+
+
+class CoreCoderRLProxyLLM:
+    """CoreCoder LLM adapter that routes Agent.chat turns through the RL proxy."""
+
+    def __init__(self, args: argparse.Namespace, session_id: str, metadata: dict[str, Any]):
+        self.args = args
+        self.session_id = session_id
+        self.metadata = metadata
+        self.client = httpx.Client(timeout=None)
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+
+    def close(self):
+        self.client.close()
+
+    def chat(self, messages: list[dict], tools: list[dict] | None = None, on_token=None) -> LLMResponse:
+        payload: dict[str, Any] = {
+            "model": self.args.model,
+            "session_id": self.session_id,
+            "turn_type": "main",
+            "session_done": False,
+            "messages": messages,
+            "tools": tools or [],
+            "tool_choice": "auto",
+            "temperature": self.args.temperature,
+            "max_tokens": self.args.max_tokens,
+        }
+        payload.update({k: v for k, v in self.metadata.items() if v not in (None, "")})
+        data = self._post_json(self.args.url, payload)
+        choice = (data.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        usage = data.get("usage") or {}
+        self.total_prompt_tokens += int(usage.get("prompt_tokens") or 0)
+        self.total_completion_tokens += int(usage.get("completion_tokens") or 0)
+        content = msg.get("content") or ""
+        if content and on_token:
+            on_token(content)
+        parsed = []
+        for raw in msg.get("tool_calls") or []:
+            fn = raw.get("function") or {}
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {"code": parse_python_tool_arguments(args)}
+            parsed.append(ToolCall(id=raw.get("id") or f"call_{uuid.uuid4().hex[:8]}", name=fn.get("name") or "", arguments=args))
+        return LLMResponse(content=content, tool_calls=parsed)
+
+    def finalize(self, messages: list[dict], final_correct: bool, reward: float, final_answer: str, tool_summary: dict[str, Any]) -> dict[str, Any]:
+        base_url = self.args.url.rsplit("/v1/chat/completions", 1)[0]
+        url = base_url + "/corecoder/session_done"
+        payload = {
+            "session_id": self.session_id,
+            "messages": messages,
+            "final_correct": final_correct,
+            "reward": reward,
+            "final_answer": final_answer,
+            **self.metadata,
+            **tool_summary,
+        }
+        return self._post_json(url, payload)
+
+    def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self.args.api_key}"} if self.args.api_key else {}
+        last_error: Exception | None = None
+        for attempt in range(self.args.request_retries + 1):
+            try:
+                resp = self.client.post(url, headers=headers, json=payload, timeout=None)
+                if resp.status_code == 503 and attempt < self.args.request_retries:
+                    time.sleep(self.args.retry_delay)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
+                last_error = exc
+                if attempt >= self.args.request_retries:
+                    break
+                time.sleep(self.args.retry_delay)
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError(f"request failed: {url}")
 
 
 def load_scenarios(path: Path, limit: int, seed: int | None = None) -> list[dict[str, Any]]:
@@ -47,64 +154,7 @@ def load_scenarios(path: Path, limit: int, seed: int | None = None) -> list[dict
 
 def build_user_message(scenario: dict[str, Any]) -> str:
     question = scenario.get("question") or scenario.get("opening_user_message", "")
-    return f"Solve this math word problem. You may use the python tool if it helps. Give a concise final answer.\n\n{question}"
-
-
-def post_turn(client: httpx.Client, args: argparse.Namespace, session_id: str, messages: list[dict[str, Any]], done: bool, metadata: dict[str, Any], max_tokens: int) -> dict[str, Any]:
-    payload = {
-        "model": args.model,
-        "session_id": session_id,
-        "turn_type": "main",
-        "session_done": done,
-        "messages": messages,
-        "tools": [PYTHON_TOOL_SCHEMA],
-        "tool_choice": "auto",
-        "temperature": args.temperature,
-        "max_tokens": max_tokens,
-    }
-    payload.update({k: v for k, v in metadata.items() if v not in (None, "")})
-    headers = {"Authorization": f"Bearer {args.api_key}"} if args.api_key else {}
-    last_error: Exception | None = None
-    for attempt in range(args.request_retries + 1):
-        try:
-            resp = client.post(args.url, headers=headers, json=payload, timeout=None)
-            if resp.status_code == 503 and attempt < args.request_retries:
-                time.sleep(args.retry_delay)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ConnectError) as exc:
-            last_error = exc
-            if attempt >= args.request_retries:
-                break
-            time.sleep(args.retry_delay)
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("request failed without response")
-
-
-def assistant_message(output: dict[str, Any]) -> dict[str, Any]:
-    choice = (output.get("choices") or [{}])[0]
-    msg = dict(choice.get("message") or {})
-    msg.setdefault("role", "assistant")
-    if msg.get("content") is None:
-        msg["content"] = ""
-    return msg
-
-
-def execute_tool_call(tool_call: dict[str, Any], timeout: float) -> tuple[dict[str, Any], dict[str, Any]]:
-    fn = tool_call.get("function") or {}
-    name = fn.get("name", "")
-    call_id = tool_call.get("id") or f"call_{uuid.uuid4().hex[:8]}"
-    if name != "python":
-        content = json.dumps({"ok": False, "error": f"unsupported tool: {name}"}, ensure_ascii=False)
-        return {"role": "tool", "tool_call_id": call_id, "name": name or "unknown", "content": content}, {"ok": False, "tool_name": name}
-    code = parse_python_tool_arguments(fn.get("arguments"))
-    result = execute_python_tool(code, timeout=timeout)
-    return (
-        {"role": "tool", "tool_call_id": call_id, "name": "python", "content": result.to_message_content()},
-        {"ok": result.ok, "tool_name": "python", "tool_code": code, "tool_output": result.output, "tool_error": result.error},
-    )
+    return MATH_AGENT_TASK_PREFIX + question
 
 
 def normalize_number(text: str) -> str | None:
@@ -125,19 +175,45 @@ def final_correct(final_text: str, reference: str) -> bool:
     return normalize_number(final_text) == normalize_number(reference)
 
 
-def run_session(client: httpx.Client, args: argparse.Namespace, scenario: dict[str, Any]) -> dict[str, Any]:
-    session_id = f"corecoder-tooluse-{scenario.get('scenario_id', 'scenario')}-{uuid.uuid4().hex[:8]}"
-    messages = [
-        {"role": "system", "content": TOOLUSE_SYSTEM_PROMPT},
-        {"role": "user", "content": build_user_message(scenario)},
-    ]
+def collect_tool_summary(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    tool_calls = []
+    tool_messages = []
+    tool_results = []
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            tool_calls.extend(msg.get("tool_calls") or [])
+        elif msg.get("role") == "tool":
+            tool_messages.append(msg)
+            try:
+                parsed = json.loads(msg.get("content") or "{}")
+            except json.JSONDecodeError:
+                parsed = {"ok": False, "output": msg.get("content", "")}
+            tool_results.append({
+                "ok": bool(parsed.get("ok")),
+                "tool_name": msg.get("name") or "python",
+                "tool_output": parsed.get("output", ""),
+                "tool_error": parsed.get("error", ""),
+            })
+    tool_success = bool(tool_results) and all(r.get("ok") for r in tool_results)
+    return {
+        "tool_calls": tool_calls,
+        "tool_messages": tool_messages,
+        "tool_results": tool_results,
+        "tool_call_count": len(tool_calls),
+        "tool_success": tool_success,
+        "tool_name": "python" if tool_calls else "none",
+    }
+
+
+def run_session(args: argparse.Namespace, scenario: dict[str, Any]) -> dict[str, Any]:
+    session_id = f"corecoder-agent-tooluse-{scenario.get('scenario_id', 'scenario')}-{uuid.uuid4().hex[:8]}"
     metadata = {
         "scenario_id": scenario.get("scenario_id"),
-        "student_mode": "tool_env",
+        "student_mode": "corecoder_agent",
         "student_model": "corecoder_policy",
         "feeder_id": args.feeder_id,
         "rl_method": args.rl_method,
-        "prompt_source": "tooluse",
+        "prompt_source": "corecoder_agent_tooluse",
         "extra_prompt_model": "none",
         "requires_tool": "optional",
         "allowed_tools": "python",
@@ -145,46 +221,33 @@ def run_session(client: httpx.Client, args: argparse.Namespace, scenario: dict[s
         "reference_answer": scenario.get("reference_answer"),
         "checker": scenario.get("checker"),
     }
-    first = post_turn(client, args, session_id, messages, False, metadata, args.tool_call_max_tokens)
-    assistant = assistant_message(first)
-    tool_calls = assistant.get("tool_calls") or []
-    messages.append(assistant)
-
-    tool_messages = []
-    tool_results = []
-    for call in tool_calls[: args.max_tool_calls]:
-        tool_msg, tool_meta = execute_tool_call(call, timeout=args.tool_timeout)
-        messages.append(tool_msg)
-        tool_messages.append(tool_msg)
-        tool_results.append(tool_meta)
-
-    tool_success = bool(tool_results) and all(r.get("ok") for r in tool_results)
-    metadata.update({
-        "tool_call_count": len(tool_calls),
-        "tool_success": tool_success,
-        "tool_name": "python" if tool_calls else "none",
-    })
-
-    final = post_turn(client, args, session_id, messages, True, metadata, args.final_max_tokens)
-    final_msg = assistant_message(final)
-    messages.append(final_msg)
-    is_correct = final_correct(final_msg.get("content", ""), scenario.get("reference_answer", ""))
-    reward = 1.0 if is_correct else 0.0
-
-    return {
-        "session_id": session_id,
-        "scenario_id": scenario.get("scenario_id"),
-        "question": scenario.get("question"),
-        "reference_answer": scenario.get("reference_answer"),
-        "tool_calls": tool_calls,
-        "tool_messages": tool_messages,
-        "tool_results": tool_results,
-        "final_answer": final_msg.get("content", ""),
-        "tool_success": tool_success,
-        "final_correct": is_correct,
-        "reward": reward,
-        "messages": messages,
-    }
+    llm = CoreCoderRLProxyLLM(args, session_id, metadata)
+    agent = Agent(
+        llm=llm,
+        tools=[PythonMathTool(timeout=args.tool_timeout)],
+        max_context_tokens=args.max_context_tokens,
+        max_rounds=args.max_agent_rounds,
+    )
+    try:
+        final_answer = agent.chat(build_user_message(scenario))
+        full_messages = agent._full_messages()
+        tool_summary = collect_tool_summary(full_messages)
+        is_correct = final_correct(final_answer, scenario.get("reference_answer", ""))
+        reward = 1.0 if is_correct else 0.0
+        llm.finalize(full_messages, is_correct, reward, final_answer, tool_summary)
+        return {
+            "session_id": session_id,
+            "scenario_id": scenario.get("scenario_id"),
+            "question": scenario.get("question"),
+            "reference_answer": scenario.get("reference_answer"),
+            "final_answer": final_answer,
+            "final_correct": is_correct,
+            "reward": reward,
+            "messages": full_messages,
+            **tool_summary,
+        }
+    finally:
+        llm.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,10 +262,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=Path(os.getenv("CORECODER_TOOLUSE_OUTPUT", "/root/autodl-tmp/corecoder_rl/logs/corecoder_tooluse_trajectories.jsonl")))
     parser.add_argument("--temperature", type=float, default=float(os.getenv("CORECODER_TOOLUSE_TEMPERATURE", "0.2")))
     parser.add_argument("--tool-timeout", type=float, default=float(os.getenv("CORECODER_TOOL_TIMEOUT", "3")))
-    parser.add_argument("--max-tool-calls", type=int, default=int(os.getenv("CORECODER_MAX_TOOL_CALLS", "2")))
-    parser.add_argument("--tool-call-max-tokens", type=int, default=int(os.getenv("CORECODER_TOOL_CALL_MAX_TOKENS", "512")))
-    parser.add_argument("--final-max-tokens", type=int, default=int(os.getenv("CORECODER_TOOLUSE_FINAL_MAX_TOKENS", "512")))
-    parser.add_argument("--feeder-id", default=os.getenv("CORECODER_FEEDER_ID", "tooluse_python_feeder"))
+    parser.add_argument("--max-tokens", type=int, default=int(os.getenv("CORECODER_TOOLUSE_MAX_TOKENS", "512")))
+    parser.add_argument("--max-agent-rounds", type=int, default=int(os.getenv("CORECODER_MAX_AGENT_ROUNDS", "4")))
+    parser.add_argument("--max-context-tokens", type=int, default=int(os.getenv("CORECODER_MAX_CONTEXT_TOKENS", "32768")))
+    parser.add_argument("--feeder-id", default=os.getenv("CORECODER_FEEDER_ID", "corecoder_agent_tooluse_feeder"))
     parser.add_argument("--rl-method", default=os.getenv("CORECODER_RL_METHOD", "opsd_tooluse"))
     parser.add_argument("--request-retries", type=int, default=int(os.getenv("CORECODER_TOOLUSE_REQUEST_RETRIES", "8")))
     parser.add_argument("--retry-delay", type=float, default=float(os.getenv("CORECODER_TOOLUSE_RETRY_DELAY", "5")))
@@ -212,12 +275,12 @@ def main(argv: list[str] | None = None) -> int:
     scenarios = load_scenarios(args.scenario_bank, args.limit, args.seed)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.dry_run:
-        print(json.dumps({"scenarios": [s.get("scenario_id") for s in scenarios], "tools": [PYTHON_TOOL_SCHEMA]}, ensure_ascii=False))
+        print(json.dumps({"scenarios": [s.get("scenario_id") for s in scenarios], "mode": "corecoder_agent"}, ensure_ascii=False))
         return 0
 
-    with httpx.Client() as client, args.output.open("a", encoding="utf-8") as out:
+    with args.output.open("a", encoding="utf-8") as out:
         for scenario in scenarios:
-            row = run_session(client, args, scenario)
+            row = run_session(args, scenario)
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             out.flush()
             print(json.dumps({

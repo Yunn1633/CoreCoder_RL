@@ -21,4 +21,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["corecoder_rl*"]
+include = ["corecoder*", "corecoder_rl*"]
