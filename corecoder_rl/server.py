@@ -157,6 +157,29 @@ def _majority_vote(scores: list[int | None]) -> float:
     return float(top[0])
 
 
+def _extract_topk_logprobs_from_meta(meta: dict[str, Any], response_len: int) -> tuple[list[list[float]], list[list[int]]]:
+    raw_rows = meta.get("input_top_logprobs", [])
+    if not isinstance(raw_rows, list) or response_len <= 0:
+        return [], []
+    rows = raw_rows[-response_len:]
+    topk_log_probs: list[list[float]] = []
+    topk_indices: list[list[int]] = []
+    for row in rows:
+        vals: list[float] = []
+        ids: list[int] = []
+        if isinstance(row, list):
+            for item in row:
+                if isinstance(item, (list, tuple)) and len(item) >= 2 and item[0] is not None and item[1] is not None:
+                    try:
+                        vals.append(float(item[0]))
+                        ids.append(int(item[1]))
+                    except (TypeError, ValueError):
+                        continue
+        topk_log_probs.append(vals)
+        topk_indices.append(ids)
+    return topk_log_probs, topk_indices
+
+
 async def reward_func(args, sample_or_samples, **kwargs):
     if isinstance(sample_or_samples, list):
         return [{"score": s.reward.get("score", 0.0) if isinstance(s.reward, dict) else 0.0}
@@ -249,6 +272,7 @@ class CoreCoderAPIServer:
             except OSError:
                 self._teacher_extra_prompt_api_key = ""
         self._teacher_extra_prompt_cache: dict[str, str] = {}
+        self._teacher_topk = int(os.getenv("CORECODER_OPSD_TEACHER_TOPK", "32"))
 
         self._prm_enabled = getattr(args, "prm_enable", False)
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
@@ -687,9 +711,9 @@ class CoreCoderAPIServer:
         full_ids = self.tokenizer(full_text, add_special_tokens=False)["input_ids"]
         return prompt_ids, full_ids
 
-    async def _score_teacher_log_probs(self, messages: list, response_msg: dict, tools, response_len: int, metadata: dict[str, Any] | None = None) -> list[float]:
+    async def _score_teacher_distribution(self, messages: list, response_msg: dict, tools, response_len: int, metadata: dict[str, Any] | None = None) -> tuple[list[float], list[list[float]], list[list[int]]]:
         if not self._teacher_logprob_enabled or response_len <= 0:
-            return []
+            return [], [], []
         try:
             metadata = metadata or {}
             extra_prompt = await self._generate_teacher_extra_prompt(messages, response_msg, metadata)
@@ -698,7 +722,7 @@ class CoreCoderAPIServer:
                 metadata["teacher_extra_prompt_model"] = self._teacher_extra_prompt_model
             prompt_ids, full_ids = self._build_teacher_scoring_ids(messages, response_msg, tools, metadata, extra_prompt)
             if len(full_ids) <= len(prompt_ids):
-                return []
+                return [], [], []
             payload = {
                 "input_ids": full_ids,
                 "sampling_params": {
@@ -710,6 +734,7 @@ class CoreCoderAPIServer:
                 },
                 "return_logprob": True,
                 "logprob_start_len": max(0, len(prompt_ids) - 1),
+                "top_logprobs_num": max(0, self._teacher_topk),
             }
             url = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
             async with httpx.AsyncClient(timeout=None) as client:
@@ -720,13 +745,15 @@ class CoreCoderAPIServer:
             pairs = meta.get("input_token_logprobs", [])
             vals = [float(p[0]) for p in pairs if isinstance(p, (list, tuple)) and len(p) >= 2 and p[0] is not None]
             if len(vals) >= response_len:
-                return vals[-response_len:]
-            if vals:
+                vals = vals[-response_len:]
+            elif vals:
                 logger.warning("[CoreCoder] teacher logprob length short: got=%d want=%d", len(vals), response_len)
-                return vals + [vals[-1]] * (response_len - len(vals))
+                vals = vals + [vals[-1]] * (response_len - len(vals))
+            topk_log_probs, topk_indices = _extract_topk_logprobs_from_meta(meta, response_len)
+            return vals, topk_log_probs, topk_indices
         except Exception as e:
-            logger.warning("[CoreCoder] teacher logprob scoring failed: %s", e)
-        return []
+            logger.warning("[CoreCoder] teacher distribution scoring failed: %s", e)
+        return [], [], []
 
     # ---------------------------------------------------- request handling
     async def _handle_request(
@@ -825,10 +852,18 @@ class CoreCoderAPIServer:
             turn_num = self._turn_counts[session_id]
 
             metadata = dict(self._session_metadata.get(session_id, {}))
-            teacher_logprobs = await self._score_teacher_log_probs(messages, response_msg, tools, len(response_ids), metadata)
+            teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = await self._score_teacher_distribution(messages, response_msg, tools, len(response_ids), metadata)
             if len(teacher_logprobs) != len(response_ids):
                 teacher_logprobs = response_logprobs[:]
                 logger.warning("[CoreCoder] falling back to rollout logprobs as teacher targets for session=%s turn=%d", session_id, turn_num)
+            if (
+                len(teacher_topk_logprobs) != len(response_ids)
+                or len(teacher_topk_indices) != len(response_ids)
+                or any(not row for row in teacher_topk_logprobs)
+                or any(not row for row in teacher_topk_indices)
+            ):
+                teacher_topk_logprobs = [[lp] for lp in teacher_logprobs]
+                teacher_topk_indices = [[tok] for tok in response_ids]
 
             turn_data = {
                 "turn": turn_num,
@@ -836,6 +871,8 @@ class CoreCoderAPIServer:
                 "response_ids": response_ids,
                 "response_logprobs": response_logprobs,
                 "teacher_logprobs": teacher_logprobs,
+                "teacher_topk_logprobs": teacher_topk_logprobs,
+                "teacher_topk_indices": teacher_topk_indices,
                 "prompt_text": prompt_text,
                 "response_text": response_text,
                 "metadata": metadata,
@@ -971,6 +1008,8 @@ class CoreCoderAPIServer:
         sample.loss_mask = [0] * len(response_ids) if exclude else [1] * len(response_ids)
         sample.rollout_log_probs = turn_data["response_logprobs"]
         sample.teacher_log_probs = turn_data.get("teacher_logprobs") or turn_data["response_logprobs"]
+        sample.teacher_topk_log_probs = turn_data.get("teacher_topk_logprobs")
+        sample.teacher_topk_indices = turn_data.get("teacher_topk_indices")
         sample.status = Sample.Status.COMPLETED
         sample.index = next(self._index_counter)
         sample.group_index = next(self._group_counter)

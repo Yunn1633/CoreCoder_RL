@@ -25,6 +25,8 @@ class Sample:
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
     teacher_log_probs: list[float] | None = None  # Teacher log probabilities on the same response tokens
+    teacher_topk_log_probs: list[list[float]] | None = None  # Teacher top-k log probabilities per response position
+    teacher_topk_indices: list[list[int]] | None = None  # Teacher top-k token ids per response position
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
 

@@ -17,6 +17,8 @@ def pack_sequences(
     returns: list[float],
     rollout_log_probs: list[list[float]] | None = None,
     teacher_log_probs: list[list[float]] | None = None,
+    teacher_topk_log_probs: list[list[list[float]]] | None = None,
+    teacher_topk_indices: list[list[list[int]]] | None = None,
     multimodal_train_inputs: list[dict] | None = None,
     max_tokens_per_gpu: int | None = None,
     num_packs: int | None = None,
@@ -72,6 +74,8 @@ def pack_sequences(
         flat_returns = []
         flat_rollout_log_probs = []
         flat_teacher_log_probs = []
+        flat_teacher_topk_log_probs = []
+        flat_teacher_topk_indices = []
 
         for i in indices:
             seq_tokens = tokens[i]
@@ -87,6 +91,10 @@ def pack_sequences(
                 flat_rollout_log_probs.extend(rollout_log_probs[i])
             if teacher_log_probs:
                 flat_teacher_log_probs.extend(teacher_log_probs[i])
+            if teacher_topk_log_probs:
+                flat_teacher_topk_log_probs.extend(teacher_topk_log_probs[i])
+            if teacher_topk_indices:
+                flat_teacher_topk_indices.extend(teacher_topk_indices[i])
             cu_seqlens.append(cu_seqlens[-1] + len(seq_tokens))
 
         packed_batch = {
@@ -106,6 +114,17 @@ def pack_sequences(
                 flat_teacher_log_probs, dtype=torch.float32, device=torch.cuda.current_device()
             ),
         }
+
+        if teacher_topk_log_probs and flat_teacher_topk_log_probs:
+            max_k = max((len(row) for row in flat_teacher_topk_log_probs), default=1)
+            padded_vals = [list(row) + [float("-inf")] * (max_k - len(row)) for row in flat_teacher_topk_log_probs]
+            padded_ids = [list(row) + [0] * (max_k - len(row)) for row in flat_teacher_topk_indices]
+            packed_batch["teacher_topk_log_probs"] = torch.tensor(
+                padded_vals, dtype=torch.float32, device=torch.cuda.current_device()
+            )
+            packed_batch["teacher_topk_indices"] = torch.tensor(
+                padded_ids, dtype=torch.long, device=torch.cuda.current_device()
+            )
 
         # Collect and add multimodal training tensors for this partition
         if multimodal_train_inputs:
@@ -181,8 +200,8 @@ def unpack_sequences(packed_batch: dict) -> list[dict]:
                         instance[key] = value[
                             end_idx - 1 - response_lengths[i] - pad_length : end_idx - 1 - pad_length
                         ]
-                    elif key in ["rollout_log_probs", "teacher_log_probs"]:
-                        # Response-only logprob arrays are packed based on response_lengths.
+                    elif key in ["rollout_log_probs", "teacher_log_probs", "teacher_topk_log_probs", "teacher_topk_indices"]:
+                        # Response-only arrays are packed based on response_lengths.
                         instance[key] = value[sum(response_lengths[:i]) : sum(response_lengths[: i + 1])]
                     elif key in ["tokens", "position_ids"]:
                         # For other tensor attributes, try to slice them

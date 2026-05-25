@@ -481,6 +481,12 @@ class FSDPTrainRayActor(TrainRayActor):
                     teacher_log_probs=(
                         rollout_data["teacher_log_probs"][start:end] if "teacher_log_probs" in rollout_data else None
                     ),
+                    teacher_topk_log_probs=(
+                        rollout_data["teacher_topk_log_probs"][start:end] if "teacher_topk_log_probs" in rollout_data else None
+                    ),
+                    teacher_topk_indices=(
+                        rollout_data["teacher_topk_indices"][start:end] if "teacher_topk_indices" in rollout_data else None
+                    ),
                     multimodal_train_inputs=(
                         rollout_data["multimodal_train_inputs"][start:end]
                         if "multimodal_train_inputs" in rollout_data
@@ -657,12 +663,64 @@ class FSDPTrainRayActor(TrainRayActor):
                 log_probs = log_probs[:n]
 
             logprob_diff = log_probs - teacher_log_probs
-            distill_token_loss = logprob_diff.pow(2)
-            distill_abs_diff = logprob_diff.abs()
-            loss = sum_of_sample_mean(distill_token_loss, response_lengths, loss_masks)
+            distill_token_mse = logprob_diff.pow(2)
+            distill_abs_diff_tokens = logprob_diff.abs()
+
+            # OPSD paper objective: minimize forward KL KL(P_teacher || P_student)
+            # on each on-policy student prefix. We approximate the full vocabulary
+            # teacher distribution with teacher top-k support collected during
+            # rollout, renormalize that support, and clip pointwise KL terms.
+            missing_topk = [
+                idx
+                for idx, batch in enumerate(unpacked_batches)
+                if "teacher_topk_log_probs" not in batch or "teacher_topk_indices" not in batch
+            ]
+            if missing_topk:
+                raise KeyError(f"teacher_topk_log_probs/teacher_topk_indices required for OPSD KL. Missing in batches: {missing_topk}")
+            teacher_topk_log_probs = torch.cat([batch["teacher_topk_log_probs"] for batch in unpacked_batches], dim=0).to(device=log_probs.device)
+            teacher_topk_indices = torch.cat([batch["teacher_topk_indices"] for batch in unpacked_batches], dim=0).to(device=log_probs.device, dtype=torch.long)
+            if teacher_topk_log_probs.shape[0] != log_probs.numel():
+                n = min(teacher_topk_log_probs.shape[0], log_probs.numel())
+                teacher_topk_log_probs = teacher_topk_log_probs[:n]
+                teacher_topk_indices = teacher_topk_indices[:n]
+                log_probs = log_probs[:n]
+                teacher_log_probs = teacher_log_probs[:n]
+
+            shifted_logits = logits[:-1, :]
+            cu_seqlens = packed_batch["cu_seqlens"].tolist()
+            response_logits = []
+            for i, response_len in enumerate(response_lengths):
+                end_idx = int(cu_seqlens[i + 1])
+                response_logits.append(shifted_logits[end_idx - 1 - response_len : end_idx - 1])
+            response_logits = torch.cat(response_logits, dim=0)
+            if self.args.rollout_temperature is not None:
+                response_logits = response_logits.div(self.args.rollout_temperature)
+
+            gathered_student_topk = []
+            chunk_size = int(os.getenv("CORECODER_OPSD_KL_CHUNK_SIZE", "256"))
+            for start in range(0, response_logits.shape[0], chunk_size):
+                end = min(start + chunk_size, response_logits.shape[0])
+                chunk_log_probs = torch.log_softmax(response_logits[start:end], dim=-1)
+                gathered_student_topk.append(chunk_log_probs.gather(-1, teacher_topk_indices[start:end]))
+            student_topk_log_probs = torch.cat(gathered_student_topk, dim=0)
+
+            finite_mask = torch.isfinite(teacher_topk_log_probs)
+            teacher_topk_log_probs = teacher_topk_log_probs.masked_fill(~finite_mask, float("-inf"))
+            teacher_support_log_probs = teacher_topk_log_probs - torch.logsumexp(teacher_topk_log_probs, dim=-1, keepdim=True)
+            teacher_support_probs = torch.exp(teacher_support_log_probs).masked_fill(~finite_mask, 0.0).detach()
+            pointwise_kl = teacher_support_probs * (teacher_support_log_probs.detach() - student_topk_log_probs)
+            clip = float(os.getenv("CORECODER_OPSD_POINTWISE_KL_CLIP", os.getenv("CORECODER_OPSD_TOKEN_LOGRATIO_CLIP", "5.0")))
+            pointwise_kl = pointwise_kl.clamp(min=-clip, max=clip)
+            forward_kl_tokens = pointwise_kl.sum(dim=-1)
+            loss = sum_of_sample_mean(forward_kl_tokens, response_lengths, loss_masks)
+
             teacher_logprob_mean = sum_of_sample_mean(teacher_log_probs, response_lengths, loss_masks).detach()
             student_logprob_mean = sum_of_sample_mean(log_probs, response_lengths, loss_masks).detach()
-            distill_abs_diff = sum_of_sample_mean(distill_abs_diff, response_lengths, loss_masks).detach()
+            distill_abs_diff = sum_of_sample_mean(distill_abs_diff_tokens, response_lengths, loss_masks).detach()
+            distill_mse = sum_of_sample_mean(distill_token_mse, response_lengths, loss_masks).detach()
+            support_mass = torch.exp(torch.logsumexp(teacher_topk_log_probs, dim=-1))
+            importance_mean = sum_of_sample_mean(support_mass, response_lengths, loss_masks).detach()
+            forward_kl_estimate = sum_of_sample_mean(forward_kl_tokens, response_lengths, loss_masks).detach()
 
             entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
             entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
@@ -671,8 +729,10 @@ class FSDPTrainRayActor(TrainRayActor):
             reported = {
                 "loss": loss.detach(),
                 "opd_loss": loss.detach(),
-                "opd_logprob_mse": sum_of_sample_mean(distill_token_loss, response_lengths, loss_masks).detach(),
+                "opsd_forward_kl": forward_kl_estimate,
+                "opd_logprob_mse": distill_mse,
                 "opd_logprob_abs_diff": distill_abs_diff,
+                "opsd_teacher_topk_mass": importance_mean,
                 "student_log_probs": student_logprob_mean,
                 "teacher_log_probs": teacher_logprob_mean,
                 "entropy_loss": entropy_loss.detach(),
