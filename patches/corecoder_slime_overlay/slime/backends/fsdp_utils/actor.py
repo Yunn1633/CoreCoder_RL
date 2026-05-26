@@ -576,6 +576,35 @@ class FSDPTrainRayActor(TrainRayActor):
                 torch.zeros(rollout_data["response_lengths"][i])
                 for i in range(len(rollout_data["rewards"]))
             ]
+        elif self.args.advantage_estimator == "step_wise":
+            required = ["step_wise_step_rewards", "step_wise_step_token_spans", "step_wise_step_indices"]
+            missing = [key for key in required if key not in rollout_data]
+            if missing:
+                raise KeyError(f"step_wise requires rollout_data keys: {missing}")
+
+            advantages = []
+            for i in range(len(rollout_data["rewards"])):
+                response_len = int(rollout_data["response_lengths"][i])
+                adv = torch.zeros(response_len, dtype=torch.float32)
+                scores = rollout_data["step_wise_step_rewards"][i] or []
+                spans = rollout_data["step_wise_step_token_spans"][i] or []
+                aligned_len = min(len(scores), len(spans))
+                for j in range(aligned_len):
+                    span = spans[j]
+                    if not isinstance(span, (list, tuple)) or len(span) != 2:
+                        continue
+                    start = max(0, min(response_len, int(span[0])))
+                    end = max(0, min(response_len, int(span[1])))
+                    if start >= end:
+                        continue
+                    adv[start:end] = float(scores[j])
+                loss_mask = torch.tensor(rollout_data["loss_masks"][i], dtype=torch.float32)
+                if loss_mask.numel() != response_len:
+                    loss_mask = loss_mask[:response_len]
+                    if loss_mask.numel() < response_len:
+                        loss_mask = torch.nn.functional.pad(loss_mask, (0, response_len - loss_mask.numel()))
+                advantages.append(adv * loss_mask)
+            rollout_data["advantages"] = rollout_data["returns"] = advantages
         else:
             raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
 
@@ -790,6 +819,8 @@ class FSDPTrainRayActor(TrainRayActor):
 
         advantages = advantages.to(device=log_probs.device)
         old_log_probs = old_log_probs.to(device=log_probs.device)
+        advantage_mean = sum_of_sample_mean(advantages.detach(), response_lengths, loss_masks).detach()
+        advantage_abs_mean = sum_of_sample_mean(advantages.detach().abs(), response_lengths, loss_masks).detach()
         ppo_kl = old_log_probs - log_probs
 
         if self.args.use_opsm:
@@ -868,6 +899,8 @@ class FSDPTrainRayActor(TrainRayActor):
             "pg_clipfrac": pg_clipfrac.detach(),
             "ppo_kl": ppo_kl.detach(),
             "entropy_loss": entropy_loss.detach(),
+            "advantage_mean": advantage_mean,
+            "advantage_abs_mean": advantage_abs_mean,
         }
 
         if train_rollout_logprob_abs_diff is not None:

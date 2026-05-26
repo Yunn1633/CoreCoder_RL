@@ -44,6 +44,24 @@ def _flatten_message_content(content):
     return str(content) if content is not None else ""
 
 
+def _truncate_for_jsonl(text: Any, limit: int = 2000) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    return text if len(text) <= limit else text[:limit] + "...<truncated>"
+
+
+def _infer_action_type(response_text: str, tool_calls: list | None = None) -> str:
+    if tool_calls:
+        return "tool_call"
+    lower = (response_text or "").lower()
+    if "<tool_call" in lower or "tool_call" in lower:
+        return "tool_call"
+    if "answer:" in lower or "\\boxed" in response_text:
+        return "final_answer"
+    return "assistant_action"
+
+
 def _normalize_messages_for_template(messages: list[dict]) -> list[dict]:
     """Make messages compatible with the chat template.
 
@@ -273,6 +291,8 @@ class CoreCoderAPIServer:
                 self._teacher_extra_prompt_api_key = ""
         self._teacher_extra_prompt_cache: dict[str, str] = {}
         self._teacher_topk = int(os.getenv("CORECODER_OPSD_TEACHER_TOPK", "32"))
+        self._default_rl_method = os.getenv("CORECODER_RL_METHOD", "")
+        self._advantage_estimator = getattr(args, "advantage_estimator", "")
 
         self._prm_enabled = getattr(args, "prm_enable", False)
         self._prm_m = int(os.getenv("PRM_M", getattr(args, "prm_m", 3)))
@@ -373,6 +393,24 @@ class CoreCoderAPIServer:
         if token != self.expected_api_key:
             raise HTTPException(status_code=401, detail="invalid api key")
 
+    def _is_stepwise_mode(self, metadata: dict[str, Any] | None = None) -> bool:
+        metadata = metadata or {}
+        values = [
+            str(metadata.get("rl_method", "")),
+            str(self._default_rl_method),
+            str(self._advantage_estimator),
+        ]
+        return any("step" in v.lower() for v in values)
+
+    def _step_span_metadata(self, turn_data: dict[str, Any], score: float) -> dict[str, Any]:
+        response_len = int(len(turn_data.get("response_ids", []) or []))
+        turn = int(turn_data.get("turn") or 0)
+        return {
+            "step_scores": [float(score)],
+            "step_token_spans": [[0, response_len]],
+            "step_indices": [turn],
+        }
+
     def _metadata_from_body(self, body: dict[str, Any]) -> dict[str, Any]:
         request_metadata = {
             "scenario_id": body.get("scenario_id"),
@@ -399,16 +437,28 @@ class CoreCoderAPIServer:
         metadata = self._metadata_from_body(body)
         if metadata:
             self._session_metadata.setdefault(session_id, {}).update(metadata)
-        try:
-            score = float(body.get("reward"))
-        except (TypeError, ValueError):
-            score = 1.0 if bool(body.get("final_correct")) else 0.0
+        if self._is_stepwise_mode(metadata) and "final_correct" in body:
+            score = 1.0 if bool(body.get("final_correct")) else -1.0
+        else:
+            try:
+                score = float(body.get("reward"))
+            except (TypeError, ValueError):
+                score = 1.0 if bool(body.get("final_correct")) else 0.0
         pending = self._pending_turn_data.get(session_id, {})
         if pending:
             turn_num = max(pending)
-            pending[turn_num]["deterministic_score"] = score
-            pending[turn_num]["has_next_state"] = True
-            pending[turn_num].setdefault("metadata", {}).update(metadata)
+            td = pending[turn_num]
+            td["deterministic_score"] = score
+            td["has_next_state"] = True
+            td["scoring_source"] = "deterministic_final"
+            td["step_action_type"] = "final_answer"
+            td["next_state_role"] = "final_eval"
+            td["next_state_text"] = (
+                f"final_correct={body.get('final_correct')}; "
+                f"final_answer={_truncate_for_jsonl(body.get('final_answer'), 800)}; "
+                f"reference_answer={_truncate_for_jsonl(body.get('reference_answer'), 800)}"
+            )
+            td.setdefault("metadata", {}).update(metadata)
         self._flush_pending_record(session_id, None)
         self._maybe_submit_ready_samples(session_id, force_no_prm=True)
         eff = self._session_effective.pop(session_id, 0)
@@ -441,9 +491,11 @@ class CoreCoderAPIServer:
                 logger.warning("[CoreCoder] failed to write record: %s", e)
 
     def _buffer_record(self, session_id: str, turn_num: int, messages: list,
-                       prompt_text: str, response_text: str, tool_calls: list):
+                       prompt_text: str, response_text: str, tool_calls: list,
+                       response_token_count: int = 0, action_type: str | None = None):
         if not self._record_file:
             return
+        span = {"step_index": turn_num, "token_start": 0, "token_end": int(response_token_count)}
         self._pending_records[session_id] = {
             "session_id": session_id,
             "turn": turn_num,
@@ -452,10 +504,14 @@ class CoreCoderAPIServer:
             "prompt_text": prompt_text,
             "response_text": response_text,
             "tool_calls": tool_calls or None,
+            "step_action_type": action_type or _infer_action_type(response_text, tool_calls),
+            "step_action_spans": [span],
         }
 
     def _append_prm_record(self, session_id: str, turn_num: int,
-                           score: float, votes: list, representative: str):
+                           score: float, votes: list, representative: str,
+                           action_text: str = "", observation_text: str = "",
+                           observation_role: str = ""):
         if not self._prm_record_file:
             return
         rec: dict[str, Any] = {
@@ -463,6 +519,9 @@ class CoreCoderAPIServer:
             "turn": turn_num,
             "score": score,
             "votes": votes,
+            "action": _truncate_for_jsonl(action_text),
+            "observation_role": observation_role,
+            "observation": _truncate_for_jsonl(observation_text),
         }
         if score != 0.0 and representative:
             rec["representative_eval"] = representative
@@ -557,8 +616,25 @@ class CoreCoderAPIServer:
             f"{_CYAN}[CoreCoder] PRM session={session_id} turn={turn_num} "
             f"votes={votes_display} → score={final}{_RESET}"
         )
-        self._append_prm_record(session_id, turn_num, final, votes_display, representative)
-        return {"score": final, "votes": votes_display, "representative_eval": representative}
+        self._append_prm_record(
+            session_id,
+            turn_num,
+            final,
+            votes_display,
+            representative,
+            action_text=response_text,
+            observation_text=ns_text,
+            observation_role=ns_role,
+        )
+        return {
+            "score": final,
+            "votes": votes_display,
+            "representative_eval": representative,
+            "action_text": response_text,
+            "observation_text": ns_text,
+            "observation_role": ns_role,
+            "scoring_source": "prm",
+        }
 
     def _score_tool_next_state(self, session_id: str, turn_num: int, next_state) -> bool:
         """Apply deterministic process reward for tool observations.
@@ -581,6 +657,10 @@ class CoreCoderAPIServer:
             ok = "error" not in content.lower() and bool(content.strip())
         td["has_next_state"] = True
         td["deterministic_score"] = 1.0 if ok else -1.0
+        td["scoring_source"] = "deterministic_tool"
+        td["step_action_type"] = "tool_call"
+        td["next_state_role"] = "tool"
+        td["next_state_text"] = content
         logger.info("[CoreCoder] tool next_state session=%s turn=%d deterministic_score=%.1f", session_id, turn_num, td["deterministic_score"])
         self._maybe_submit_ready_samples(session_id, force_no_prm=True)
         return True
@@ -598,6 +678,10 @@ class CoreCoderAPIServer:
         td = self._pending_turn_data.get(session_id, {}).get(turn_num)
         if td is not None:
             td["has_next_state"] = True
+            td["scoring_source"] = "prm"
+            td["step_action_type"] = td.get("step_action_type") or "assistant_action"
+            td["next_state_role"] = next_state.get("role", "user") if next_state else "user"
+            td["next_state_text"] = _flatten_message_content(next_state.get("content")) if next_state else ""
 
     # ---------------------------------------------------- teacher trajectory scoring
     def _render_messages_for_teacher(self, messages: list, response_msg: dict | None = None) -> str:
@@ -852,7 +936,11 @@ class CoreCoderAPIServer:
             turn_num = self._turn_counts[session_id]
 
             metadata = dict(self._session_metadata.get(session_id, {}))
-            teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = await self._score_teacher_distribution(messages, response_msg, tools, len(response_ids), metadata)
+            action_type = _infer_action_type(response_text, tool_calls)
+            if self._is_stepwise_mode(metadata):
+                teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = [], [], []
+            else:
+                teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = await self._score_teacher_distribution(messages, response_msg, tools, len(response_ids), metadata)
             if len(teacher_logprobs) != len(response_ids):
                 teacher_logprobs = response_logprobs[:]
                 logger.warning("[CoreCoder] falling back to rollout logprobs as teacher targets for session=%s turn=%d", session_id, turn_num)
@@ -876,13 +964,24 @@ class CoreCoderAPIServer:
                 "prompt_text": prompt_text,
                 "response_text": response_text,
                 "metadata": metadata,
+                "step_action_type": action_type,
+                "step_action_spans": [{"step_index": turn_num, "token_start": 0, "token_end": len(response_ids)}],
             }
 
             logger.info(
                 "[CoreCoder] MAIN session=%s turn=%d prompt_tokens=%d response_tokens=%d",
                 session_id, turn_num, len(prompt_ids), len(response_ids),
             )
-            self._buffer_record(session_id, turn_num, messages, prompt_text, response_text, tool_calls)
+            self._buffer_record(
+                session_id,
+                turn_num,
+                messages,
+                prompt_text,
+                response_text,
+                tool_calls,
+                response_token_count=len(response_ids),
+                action_type=action_type,
+            )
             self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data
             self._maybe_submit_ready_samples(session_id)
         else:
@@ -923,6 +1022,12 @@ class CoreCoderAPIServer:
                 except Exception:
                     pass
                 prm_tasks.pop(turn_num, None)
+            if prm_result:
+                turn_data["prm_votes"] = prm_result.get("votes")
+                turn_data["prm_representative_eval"] = prm_result.get("representative_eval")
+                turn_data["next_state_role"] = prm_result.get("observation_role", turn_data.get("next_state_role"))
+                turn_data["next_state_text"] = prm_result.get("observation_text", turn_data.get("next_state_text"))
+                turn_data["scoring_source"] = prm_result.get("scoring_source", turn_data.get("scoring_source", "prm"))
             self._safe_create_task(
                 self._submit_turn_sample(turn_data, session_id, prm_result)
             )
@@ -948,6 +1053,13 @@ class CoreCoderAPIServer:
             "prompt_source": metadata.get("prompt_source"),
             "extra_prompt_model": metadata.get("extra_prompt_model"),
             "reward": score,
+            "step_score": score,
+            "step_action_type": turn_data.get("step_action_type"),
+            "step_action_span": (turn_data.get("step_action_spans") or []),
+            "step_scoring_source": turn_data.get("scoring_source"),
+            "step_action_text": _truncate_for_jsonl(turn_data.get("response_text", "")),
+            "step_observation_role": turn_data.get("next_state_role"),
+            "step_observation_text": _truncate_for_jsonl(turn_data.get("next_state_text", "")),
             "loss_mask": 0 if exclude else 1,
             "has_next_state": bool(turn_data.get("has_next_state", False)),
             "prompt_tokens": len(turn_data.get("prompt_ids", [])),
@@ -1014,6 +1126,18 @@ class CoreCoderAPIServer:
         sample.index = next(self._index_counter)
         sample.group_index = next(self._group_counter)
         sample.reward = {"score": score}
+        sample.metadata = dict(turn_data.get("metadata") or {})
+        sample.metadata.update({
+            "session_id": session_id,
+            "turn": turn_data.get("turn"),
+            "step_action_type": turn_data.get("step_action_type"),
+            "step_action_spans": turn_data.get("step_action_spans") or [],
+            "step_scoring_source": turn_data.get("scoring_source"),
+            "step_observation_role": turn_data.get("next_state_role"),
+            "step_observation_text": _truncate_for_jsonl(turn_data.get("next_state_text", "")),
+        })
+        if self._is_stepwise_mode(sample.metadata):
+            sample.metadata["step_wise"] = self._step_span_metadata(turn_data, score)
 
         if not exclude:
             self._session_effective[session_id] = self._session_effective.get(session_id, 0) + 1
