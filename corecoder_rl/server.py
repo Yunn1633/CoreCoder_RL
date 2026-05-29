@@ -18,6 +18,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
+from corecoder_rl.memory import CoreCoderMemory
+from corecoder_rl.toolprm import ToolStepPRM
+
 _GREEN = "\033[32m"
 _YELLOW = "\033[33m"
 _RED = "\033[31m"
@@ -259,6 +262,9 @@ class CoreCoderAPIServer:
         self.host = os.getenv("HOST", "0.0.0.0")
         self.port = int(os.getenv("PORT", "30000"))
         self.served_model_name = os.getenv("SERVED_MODEL_NAME", "qwen3-8b")
+        self._memory = CoreCoderMemory.from_env(logger=logger)
+        self._toolprm_enabled = os.getenv("CORECODER_TOOLPRM_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+        self._toolprm = ToolStepPRM(enabled=self._toolprm_enabled)
 
         self._index_counter = count(0)
         self._group_counter = count(0)
@@ -655,12 +661,20 @@ class CoreCoderAPIServer:
             ok = bool(parsed.get("ok")) and not parsed.get("error")
         except Exception:
             ok = "error" not in content.lower() and bool(content.strip())
+        toolprm_result = self._toolprm.score(
+            action_text=td.get("response_text", ""),
+            tool_calls=td.get("tool_calls") or [],
+            observation_text=content,
+            allowed_tools=(td.get("metadata") or {}).get("allowed_tools"),
+            history=td.get("messages") or [],
+        )
         td["has_next_state"] = True
         td["deterministic_score"] = 1.0 if ok else -1.0
         td["scoring_source"] = "deterministic_tool"
         td["step_action_type"] = "tool_call"
         td["next_state_role"] = "tool"
         td["next_state_text"] = content
+        td["toolprm"] = toolprm_result
         logger.info("[CoreCoder] tool next_state session=%s turn=%d deterministic_score=%.1f", session_id, turn_num, td["deterministic_score"])
         self._maybe_submit_ready_samples(session_id, force_no_prm=True)
         return True
@@ -857,7 +871,21 @@ class CoreCoderAPIServer:
 
         tools = body.get("tools")
 
+        policy_messages = messages
+        memory_context = self._memory.disabled_context()
+        if turn_type == "main":
+            memory_metadata = dict(self._session_metadata.get(session_id, {}))
+            policy_messages, memory_context = self._memory.inject_messages(messages, memory_metadata)
+            if memory_context.get("retrieved_memory_ids"):
+                logger.info(
+                    "[CoreCoderMemory] session=%s retrieved=%s scores=%s",
+                    session_id,
+                    memory_context.get("retrieved_memory_ids"),
+                    memory_context.get("retrieved_memory_scores"),
+                )
+
         forward_body = {k: v for k, v in body.items() if k not in _NON_STANDARD_BODY_KEYS}
+        forward_body["messages"] = policy_messages
         forward_body["stream"] = False
         forward_body.pop("stream_options", None)
         forward_body["logprobs"] = True
@@ -901,7 +929,7 @@ class CoreCoderAPIServer:
             if response_msg.get("content") is None:
                 response_msg["content"] = ""
 
-            norm_msgs = _normalize_messages_for_template(messages)
+            norm_msgs = _normalize_messages_for_template(policy_messages)
             norm_resp = _normalize_messages_for_template([response_msg])[0]
             full_norm = norm_msgs + [norm_resp]
 
@@ -940,7 +968,7 @@ class CoreCoderAPIServer:
             if self._is_stepwise_mode(metadata):
                 teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = [], [], []
             else:
-                teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = await self._score_teacher_distribution(messages, response_msg, tools, len(response_ids), metadata)
+                teacher_logprobs, teacher_topk_logprobs, teacher_topk_indices = await self._score_teacher_distribution(policy_messages, response_msg, tools, len(response_ids), metadata)
             if len(teacher_logprobs) != len(response_ids):
                 teacher_logprobs = response_logprobs[:]
                 logger.warning("[CoreCoder] falling back to rollout logprobs as teacher targets for session=%s turn=%d", session_id, turn_num)
@@ -964,6 +992,9 @@ class CoreCoderAPIServer:
                 "prompt_text": prompt_text,
                 "response_text": response_text,
                 "metadata": metadata,
+                "messages": policy_messages,
+                "tool_calls": tool_calls,
+                "memory_context": memory_context,
                 "step_action_type": action_type,
                 "step_action_spans": [{"step_index": turn_num, "token_start": 0, "token_end": len(response_ids)}],
             }
@@ -975,7 +1006,7 @@ class CoreCoderAPIServer:
             self._buffer_record(
                 session_id,
                 turn_num,
-                messages,
+                policy_messages,
                 prompt_text,
                 response_text,
                 tool_calls,
@@ -1080,7 +1111,16 @@ class CoreCoderAPIServer:
             "checker": metadata.get("checker"),
             "teacher_extra_prompt_present": bool(metadata.get("teacher_extra_prompt")),
             "teacher_extra_prompt_model": metadata.get("teacher_extra_prompt_model"),
+            "memory_enabled": bool((turn_data.get("memory_context") or {}).get("memory_enabled")),
+            "memory_injected": bool((turn_data.get("memory_context") or {}).get("memory_injected")),
+            "retrieved_memory_ids": (turn_data.get("memory_context") or {}).get("retrieved_memory_ids"),
+            "retrieved_memory_scores": (turn_data.get("memory_context") or {}).get("retrieved_memory_scores"),
+            "retrieved_memory_q_values": (turn_data.get("memory_context") or {}).get("retrieved_memory_q_values"),
+            "memory_written_id": (turn_data.get("memory_context") or {}).get("memory_written_id"),
         }
+        toolprm = turn_data.get("toolprm") or {}
+        if toolprm:
+            row.update(toolprm)
         try:
             with open(self._metrics_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1112,6 +1152,10 @@ class CoreCoderAPIServer:
             exclude = False
             logger.info("[CoreCoder] promoting session=%s turn with score=0 → loss_mask=1 (at-least-one guarantee)", session_id)
 
+        memory_context = self._memory.observe_turn(turn_data, score, exclude=exclude)
+        if memory_context:
+            turn_data["memory_context"] = memory_context
+
         sample = Sample()
         sample.prompt = turn_data["prompt_text"]
         sample.response = turn_data["response_text"]
@@ -1135,7 +1179,10 @@ class CoreCoderAPIServer:
             "step_scoring_source": turn_data.get("scoring_source"),
             "step_observation_role": turn_data.get("next_state_role"),
             "step_observation_text": _truncate_for_jsonl(turn_data.get("next_state_text", "")),
+            "memory_context": turn_data.get("memory_context") or {},
         })
+        if turn_data.get("toolprm"):
+            sample.metadata["toolprm"] = turn_data.get("toolprm")
         if self._is_stepwise_mode(sample.metadata):
             sample.metadata["step_wise"] = self._step_span_metadata(turn_data, score)
 
